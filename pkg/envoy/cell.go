@@ -117,6 +117,7 @@ func newEnvoyXDSServer(params xdsServerParams) (XDSServer, error) {
 		httpLingerConfig:              params.EnvoyProxyConfig.EnvoyHTTPUpstreamLingerTimeout,
 		envoyAccessLogEnabled:         params.EnvoyProxyConfig.EnvoyAccessLogEnabled,
 		envoyXDSMode:                  params.EnvoyProxyConfig.EnvoyXDSMode,
+		envoyNodeLocalityEnabled:      params.EnvoyProxyConfig.EnvoyNodeLocalityEnabled,
 	}
 
 	var xdsServer runnableXDSServer

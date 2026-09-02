@@ -693,6 +693,42 @@ func TestUpdateEnvoyResourcesRejectsInconsistentSnapshotInStrictADSMode(t *testi
 	require.ErrorContains(t, err, "generated ADS snapshot is inconsistent")
 }
 
+func TestUpsertLocalityEndpoints(t *testing.T) {
+	for _, mode := range []config.XDSMode{config.EnvoyXDSModeADS, config.EnvoyXDSModeStrictADS} {
+		t.Run(string(mode), func(t *testing.T) {
+			logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
+			server := newADSServer(logger, nil, nil, xdsServerConfig{
+				envoyXDSMode:             mode,
+				envoyNodeLocalityEnabled: true,
+			}, nil, nil)
+			ctx := t.Context()
+			locality := xds.NewResources()
+			locality.Endpoints[LocalityClusterName] = &envoy_config_endpoint.ClusterLoadAssignment{ClusterName: LocalityClusterName}
+
+			// The originating cluster is in bootstrap, not CDS. Its initial
+			// empty assignment must be accepted before any proxies are ready.
+			require.NoError(t, server.UpsertEnvoyResources(ctx, locality, nil))
+			snapshot, err := server.cache.GetSnapshot(localNodeID)
+			require.NoError(t, err)
+			require.Contains(t, snapshot.GetResources(EndpointTypeURL), LocalityClusterName)
+			require.Empty(t, snapshot.GetResources(ClusterTypeURL))
+
+			// Other producers must not remove the originating cluster's
+			// endpoints when they add or delete their own resources.
+			backend := xds.NewResources()
+			backend.Clusters["backend"] = &envoy_config_cluster.Cluster{
+				Name:                 "backend",
+				ClusterDiscoveryType: &envoy_config_cluster.Cluster_Type{Type: envoy_config_cluster.Cluster_EDS},
+			}
+			backend.Endpoints["backend"] = &envoy_config_endpoint.ClusterLoadAssignment{ClusterName: "backend"}
+			require.NoError(t, server.UpdateEnvoyResources(ctx, xds.NewResources(), backend, nil))
+			require.Contains(t, server.cache.GetAllResources(localNodeID).Endpoints, LocalityClusterName)
+			require.NoError(t, server.DeleteEnvoyResources(ctx, backend, nil))
+			require.Equal(t, locality.Endpoints, server.cache.GetAllResources(localNodeID).Endpoints)
+		})
+	}
+}
+
 func TestDeleteEnvoyResources(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
 	config := xdsServerConfig{

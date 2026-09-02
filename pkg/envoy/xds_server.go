@@ -177,6 +177,7 @@ type xdsServerConfig struct {
 	httpLingerConfig              int
 	envoyAccessLogEnabled         bool
 	envoyXDSMode                  config.XDSMode
+	envoyNodeLocalityEnabled      bool
 	useNPHDS                      bool
 }
 

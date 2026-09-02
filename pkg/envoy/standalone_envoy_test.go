@@ -26,6 +26,7 @@ import (
 	envoy_config_route "github.com/envoyproxy/go-control-plane/envoy/config/route/v3"
 	envoy_config_http "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/http_connection_manager/v3"
 	envoy_config_tls "github.com/envoyproxy/go-control-plane/envoy/extensions/transport_sockets/tls/v3"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/protobuf/types/known/durationpb"
 	corev1 "k8s.io/api/core/v1"
@@ -1516,6 +1517,15 @@ func TestEnvoyAdsMultipleVersionsSentBeforeNackReceived(t *testing.T) {
 }
 
 func TestEnvoyAdsLocalityClusterEndpointsACK(t *testing.T) {
+	for _, mode := range []config.XDSMode{config.EnvoyXDSModeADS, config.EnvoyXDSModeStrictADS} {
+		t.Run(mode.String(), func(t *testing.T) {
+			testEnvoyAdsLocalityClusterEndpointsACK(t, mode)
+		})
+	}
+}
+
+func testEnvoyAdsLocalityClusterEndpointsACK(t *testing.T, mode config.XDSMode) {
+	t.Helper()
 	s := setupEnvoySuite(t)
 	ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
 	defer cancel()
@@ -1536,25 +1546,24 @@ func TestEnvoyAdsLocalityClusterEndpointsACK(t *testing.T) {
 
 	xdsServer := newADSServer(logger, testipcache.NewMockIPCache(), localEndpointStore,
 		xdsServerConfig{
-			envoySocketDir:    util.GetSocketDir(testRunDir),
-			proxyGID:          1337,
-			httpNormalizePath: true,
-			metrics:           xds.NewXDSMetric(),
-			envoyXDSMode:      config.EnvoyXDSModeADS,
+			envoySocketDir:           util.GetSocketDir(testRunDir),
+			proxyGID:                 1337,
+			httpNormalizePath:        true,
+			metrics:                  xds.NewXDSMetric(),
+			envoyXDSMode:             mode,
+			envoyNodeLocalityEnabled: true,
 		},
 		nil, nil)
 	require.NotNil(t, xdsServer)
 
 	go func() {
-		err = xdsServer.run(t.Context())
-		require.NoError(t, err)
+		assert.NoError(t, xdsServer.run(t.Context()))
 	}()
 
 	accessLogServer := newAccessLogServer(logger, &proxyAccessLoggerMock{}, testRunDir, 1337, localEndpointStore, 4096)
 	require.NotNil(t, accessLogServer)
 	go func() {
-		err = accessLogServer.run(t.Context())
-		require.NoError(t, err)
+		assert.NoError(t, accessLogServer.run(t.Context()))
 	}()
 
 	starter := &onDemandXdsStarter{
@@ -1579,7 +1588,7 @@ func TestEnvoyAdsLocalityClusterEndpointsACK(t *testing.T) {
 		maxConcurrentRetries:           10,
 		maxPendingRequests:             1024,
 		nodeLocalityEnabled:            true,
-		xdsMode:                        config.EnvoyXDSModeADS,
+		xdsMode:                        mode,
 	})
 	require.NoError(t, err)
 	require.NotNil(t, envoyProxy)
@@ -1600,7 +1609,7 @@ func TestEnvoyAdsLocalityClusterEndpointsACK(t *testing.T) {
 									Protocol: envoy_config_core_v3.SocketAddress_TCP,
 									Address:  "127.0.0.1",
 									PortSpecifier: &envoy_config_core_v3.SocketAddress_PortValue{
-										PortValue: 8080,
+										PortValue: 0,
 									},
 								},
 							},

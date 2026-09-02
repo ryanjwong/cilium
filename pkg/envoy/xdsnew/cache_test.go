@@ -433,6 +433,35 @@ func TestCheckSnapshotConsistencyRejectsMissingEndpoint(t *testing.T) {
 	require.ErrorContains(t, CheckSnapshotConsistency(snap), envoy_resource.EndpointType)
 }
 
+func TestCheckSnapshotConsistencyBootstrapEndpoints(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
+	c := NewCache(logger, true, "bootstrap-cluster")
+	resources := emptyResources()
+
+	// The publisher may not have supplied EDS yet. The bootstrap cluster
+	// remains outside CDS, including after its endpoints arrive.
+	snap, err := c.GenerateSnapshot(resources, logger)
+	require.NoError(t, err)
+	require.NoError(t, CheckSnapshotConsistency(snap))
+	resources.Endpoints["bootstrap-cluster"] = &envoy_config_endpoint.ClusterLoadAssignment{ClusterName: "bootstrap-cluster"}
+	snap, err = c.GenerateSnapshot(resources, logger)
+	require.NoError(t, err)
+	require.NoError(t, CheckSnapshotConsistency(snap))
+	require.Empty(t, snap.GetResources(envoy_resource.ClusterType))
+
+	// Only explicitly configured bootstrap references are allowed. A stray
+	// assignment must still make a strict-ADS snapshot inconsistent.
+	resources.Endpoints["orphan"] = &envoy_config_endpoint.ClusterLoadAssignment{ClusterName: "orphan"}
+	snap, err = c.GenerateSnapshot(resources, logger)
+	require.NoError(t, err)
+	require.ErrorContains(t, CheckSnapshotConsistency(snap), envoy_resource.EndpointType)
+
+	delete(resources.Endpoints, "orphan")
+	snap, err = NewCache(logger, true).GenerateSnapshot(resources, logger)
+	require.NoError(t, err)
+	require.ErrorContains(t, CheckSnapshotConsistency(snap), envoy_resource.EndpointType)
+}
+
 func TestNewCache(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
 	c := NewCache(logger, false).(*cacheImpl)

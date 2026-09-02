@@ -63,6 +63,7 @@ type cacheImpl struct {
 	logger              *slog.Logger
 	hasher              hash.Hash32
 	completionCbs       *callbacks.CompletionCallbacks
+	bootstrapEndpoints  []string
 }
 
 var _ Cache = &cacheImpl{}
@@ -72,6 +73,8 @@ var _ Cache = &cacheImpl{}
 type ciliumSnapshot struct {
 	Resources  map[string]cache.Resources
 	VersionMap map[string]map[string]string
+
+	bootstrapEndpoints []string
 }
 
 // Ensure ciliumSnapshot implements cache.ResourceSnapshot.
@@ -88,9 +91,10 @@ var snapshotResourceTypes = []envoy_resource.Type{
 	NetworkPolicyHostsTypeURL,
 }
 
-func newCiliumSnapshot(resources map[string]cache.Resources) *ciliumSnapshot {
+func newCiliumSnapshot(resources map[string]cache.Resources, bootstrapEndpoints []string) *ciliumSnapshot {
 	w := &ciliumSnapshot{
-		Resources: make(map[string]cache.Resources, len(snapshotResourceTypes)),
+		Resources:          make(map[string]cache.Resources, len(snapshotResourceTypes)),
+		bootstrapEndpoints: bootstrapEndpoints,
 	}
 	for _, typeURL := range snapshotResourceTypes {
 		w.Resources[typeURL] = resources[typeURL]
@@ -181,6 +185,18 @@ func (w *ciliumSnapshot) Consistent() error {
 
 		resources := resourceGroups[responseType]
 		references := referencedResources[typeURL]
+		if responseType == cache_types.Endpoint {
+			// Bootstrap clusters do not appear in CDS, but can still
+			// subscribe to EDS resources in this snapshot.
+			for _, name := range w.bootstrapEndpoints {
+				if _, exists := resources.Items[name]; exists {
+					if references == nil {
+						references = make(map[string]bool)
+					}
+					references[name] = true
+				}
+			}
+		}
 		if len(references) != len(resources.Items) {
 			return fmt.Errorf("mismatched %q reference and resource lengths: len(%v) != %d",
 				typeURL, references, len(resources.Items))
@@ -226,7 +242,9 @@ func snapshotCacheLogger(logger *slog.Logger) controlplanelog.Logger {
 	}
 }
 
-func NewCache(logger *slog.Logger, strictAdsMode bool) Cache {
+// NewCache returns an ADS snapshot cache. bootstrapEndpoints names EDS resources
+// referenced by static bootstrap clusters rather than CDS.
+func NewCache(logger *slog.Logger, strictAdsMode bool, bootstrapEndpoints ...string) Cache {
 	snapshotCache := cache.NewSnapshotCache(strictAdsMode, cache.IDHash{}, snapshotCacheLogger(logger))
 
 	return &cacheImpl{
@@ -236,6 +254,7 @@ func NewCache(logger *slog.Logger, strictAdsMode bool) Cache {
 		logger:              logger,
 		hasher:              fnv.New32a(),
 		completionCbs:       callbacks.NewCompletionCallbacks(logger),
+		bootstrapEndpoints:  slices.Clone(bootstrapEndpoints),
 	}
 }
 
@@ -613,7 +632,7 @@ func (c *cacheImpl) GenerateSnapshot(resources *xds.Resources, logger *slog.Logg
 		versionedResources[typeURL] = resourceGroup(version, resourceMap)
 	}
 
-	return newCiliumSnapshot(versionedResources), nil
+	return newCiliumSnapshot(versionedResources, c.bootstrapEndpoints), nil
 }
 
 func (c *cacheImpl) GetCompletionCallbacks() *callbacks.CompletionCallbacks {
