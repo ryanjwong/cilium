@@ -45,6 +45,37 @@ To enable the dedicated Envoy proxy DaemonSet, install Cilium with the Helm valu
 
 Please see the :ref:`helm_reference` (keys with ``envoy.*``) for detailed information on how to configure the Envoy proxy DaemonSet.
 
+Node locality
+=============
+
+Setting ``envoy.nodeLocality.enabled=true`` gives Envoy its local zone from the
+``topology.kubernetes.io/zone`` node label and configures
+``/cilium-locality-cluster`` as its originating cluster. The option is disabled
+by default. Envoy startup fails if its own node's zone cannot be resolved.
+
+With the dedicated DaemonSet, Cilium also publishes the originating cluster's
+endpoints through EDS. It watches pods labelled ``k8s-app=cilium-envoy`` in the
+Cilium namespace and groups their nodes by zone. Only running, ready,
+non-terminating pods are included, and a node is counted once during a rollout.
+Nodes without a selected Envoy pod do not contribute to the distribution.
+
+If a ready proxy's node or zone is not yet known, Cilium publishes an empty
+assignment instead of advertising a partial distribution. Envoy falls back to
+ordinary load balancing until the missing information becomes available. An
+empty assignment is also published when no proxy pods are ready, so the
+bootstrap cluster can finish warming without waiting on pod readiness.
+
+.. note::
+
+   This supplies the originating cluster's distribution, not the upstream
+   services' locality. Cilium-generated Service EDS endpoints still need
+   locality information before Envoy can apply zone-aware routing end to end.
+   The setting alone does not enable it.
+
+   Automatic originating-cluster discovery is limited to the DaemonSet. Agent
+   pod readiness does not indicate whether an on-demand embedded Envoy process
+   is running, so embedded Envoy's bootstrap behavior is unchanged.
+
 Potential Benefits
 ==================
 

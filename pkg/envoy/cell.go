@@ -54,6 +54,7 @@ var Cell = cell.Module(
 	cell.ProvidePrivate(newArtifactCopier),
 	cell.Invoke(registerEnvoyVersionCheck),
 	cell.Invoke(registerSecretSyncer),
+	cell.Invoke(registerLocalitySyncer),
 )
 
 type xdsServerParams struct {
