@@ -6,18 +6,25 @@ package envoy
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"iter"
 	"log/slog"
 	"maps"
+	"net"
+	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
 	"github.com/cilium/hive/hivetest"
 	cilium "github.com/cilium/proxy/go/cilium/api"
+	envoy_admin "github.com/envoyproxy/go-control-plane/envoy/admin/v3"
 	envoy_config_cluster "github.com/envoyproxy/go-control-plane/envoy/config/cluster/v3"
 	envoy_config_core "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	envoy_config_core_v3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
@@ -28,8 +35,10 @@ import (
 	envoy_config_tls "github.com/envoyproxy/go-control-plane/envoy/extensions/transport_sockets/tls/v3"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/types/known/durationpb"
 	corev1 "k8s.io/api/core/v1"
+	"sigs.k8s.io/yaml"
 
 	cmtypes "github.com/cilium/cilium/pkg/clustermesh/types"
 	"github.com/cilium/cilium/pkg/completion"
@@ -64,6 +73,7 @@ const (
 // To run the standalone_envoy_test, the following have to be met:
 //
 // - Environment variable `CILIUM_ENABLE_ENVOY_UNIT_TEST` must be set
+// - `helm` must exist in the PATH for TestEnvoyDaemonSetLocalityBootstrap
 // - `cilium-envoy-starter` and `cilium-envoy` must exist in the PATH
 //   - if these were left running from a previous test, these must be killed
 //     (`pkill -9 cilium-envoy`)
@@ -1635,6 +1645,207 @@ func testEnvoyAdsLocalityClusterEndpointsACK(t *testing.T, mode config.XDSMode) 
 
 	t.Log("stopping Envoy")
 	stopEnvoy()
+}
+
+func TestEnvoyDaemonSetLocalityBootstrap(t *testing.T) {
+	if os.Getenv("CILIUM_ENABLE_ENVOY_UNIT_TEST") == "" {
+		t.Skip("skipping envoy unit test; CILIUM_ENABLE_ENVOY_UNIT_TEST not set")
+	}
+
+	for _, mode := range []config.XDSMode{config.EnvoyXDSModeADS, config.EnvoyXDSModeStrictADS} {
+		for _, localityBootstrap := range []bool{true, false} {
+			t.Run(mode.String()+"/locality="+strconv.FormatBool(localityBootstrap), func(t *testing.T) {
+				testEnvoyDaemonSetLocalityBootstrap(t, mode, localityBootstrap)
+			})
+		}
+	}
+}
+
+func testEnvoyDaemonSetLocalityBootstrap(t *testing.T, mode config.XDSMode, localityBootstrap bool) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+
+	// Keep Unix socket paths short, including when the test runs with -count.
+	testRunDir, err := os.MkdirTemp("", "envoy_ds_test")
+	require.NoError(t, err)
+	t.Cleanup(func() { assert.NoError(t, os.RemoveAll(testRunDir)) })
+	socketDir := util.GetSocketDir(testRunDir)
+	require.NoError(t, os.MkdirAll(socketDir, 0777))
+
+	// The Go bootstrap uses a shorter initial fetch timeout than the DaemonSet.
+	// Render the deployed bootstrap so it cannot hide an EDS-before-CDS stall.
+	helm := exec.CommandContext(ctx, "helm", "template", "cilium", "../../install/kubernetes/cilium",
+		"--namespace", "kube-system", "--show-only", "templates/cilium-envoy/configmap.yaml",
+		"--set", "envoy.enabled=true", "--set", "envoy.xdsMode="+mode.String(),
+		"--set", "envoy.nodeLocality.enabled="+strconv.FormatBool(localityBootstrap))
+	rendered, err := helm.CombinedOutput()
+	require.NoError(t, err, "%s", rendered)
+	var configMap corev1.ConfigMap
+	require.NoError(t, yaml.Unmarshal(rendered, &configMap))
+	bootstrap := configMap.Data["bootstrap-config.json"]
+	require.NotEmpty(t, bootstrap)
+	bootstrap = strings.ReplaceAll(bootstrap, "/var/run/cilium/envoy", filepath.Join(testRunDir, "envoy"))
+	bootstrapPath := filepath.Join(testRunDir, "bootstrap.json")
+	require.NoError(t, os.WriteFile(bootstrapPath, []byte(bootstrap), 0644))
+
+	logger := hivetest.Logger(t)
+	server := newADSServer(logger, testipcache.NewMockIPCache(), newLocalEndpointStore(), xdsServerConfig{
+		envoySocketDir:           socketDir,
+		proxyGID:                 1337,
+		metrics:                  xds.NewXDSMetric(),
+		envoyXDSMode:             mode,
+		envoyNodeLocalityEnabled: true,
+	}, nil, nil)
+	const backend = "test/backend"
+	backendAssignment := func(address string) *envoy_config_endpoint.ClusterLoadAssignment {
+		return &envoy_config_endpoint.ClusterLoadAssignment{
+			ClusterName: backend,
+			Endpoints: []*envoy_config_endpoint.LocalityLbEndpoints{{
+				LbEndpoints: []*envoy_config_endpoint.LbEndpoint{{
+					HostIdentifier: &envoy_config_endpoint.LbEndpoint_Endpoint{
+						Endpoint: &envoy_config_endpoint.Endpoint{
+							Address: &envoy_config_core.Address{Address: &envoy_config_core.Address_SocketAddress{
+								SocketAddress: &envoy_config_core.SocketAddress{
+									Address:       address,
+									PortSpecifier: &envoy_config_core.SocketAddress_PortValue{PortValue: 8080},
+								},
+							}},
+						},
+					},
+				}},
+			}},
+		}
+	}
+	resources := xds.NewResources()
+	resources.Clusters[backend] = &envoy_config_cluster.Cluster{
+		Name:                 backend,
+		ClusterDiscoveryType: &envoy_config_cluster.Cluster_Type{Type: envoy_config_cluster.Cluster_EDS},
+		ConnectTimeout:       durationpb.New(time.Second),
+		EdsClusterConfig: &envoy_config_cluster.Cluster_EdsClusterConfig{
+			EdsConfig:   CiliumConfigSource(mode),
+			ServiceName: backend,
+		},
+	}
+	resources.Endpoints[backend] = backendAssignment("192.0.2.10")
+	if localityBootstrap {
+		resources.Endpoints[LocalityClusterName] = &envoy_config_endpoint.ClusterLoadAssignment{ClusterName: LocalityClusterName}
+	}
+	// An Envoy-only restart reconnects to an agent whose service EDS is cached.
+	require.NoError(t, server.UpsertEnvoyResources(ctx, resources, nil))
+	serverDone := make(chan error, 1)
+	go func() { serverDone <- server.run(ctx) }()
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case err := <-serverDone:
+			assert.NoError(t, err)
+		case <-time.After(3 * time.Second):
+			t.Error("xDS server did not stop")
+		}
+	})
+	require.Eventually(t, func() bool {
+		_, err := os.Stat(util.GetXDSSocketPath(socketDir))
+		return err == nil
+	}, 3*time.Second, 10*time.Millisecond)
+
+	logPath := filepath.Join(testRunDir, "envoy.log")
+	logFile, err := os.Create(logPath)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		assert.NoError(t, logFile.Close())
+		if t.Failed() {
+			log, err := os.ReadFile(logPath)
+			if err == nil {
+				t.Logf("Envoy log:\n%s", log)
+			}
+		}
+	})
+	cmd := exec.Command("cilium-envoy-starter", "-c", bootstrapPath,
+		"--service-zone", "zone-a", "--concurrency", "1", "--base-id", "71", "--log-level", "debug")
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Stdout, cmd.Stderr = logFile, logFile
+	started := time.Now()
+	require.NoError(t, cmd.Start())
+	processDone := make(chan error, 1)
+	go func() { processDone <- cmd.Wait() }()
+	t.Cleanup(func() {
+		// Stop the starter and its child, without touching another test's Envoy.
+		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGTERM)
+		select {
+		case <-processDone:
+		case <-time.After(3 * time.Second):
+			_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+			select {
+			case <-processDone:
+			case <-time.After(3 * time.Second):
+				t.Error("Envoy did not stop")
+			}
+		}
+	})
+
+	client := &http.Client{Timeout: 500 * time.Millisecond}
+	t.Cleanup(client.CloseIdleConnections)
+	require.EventuallyWithT(t, func(c *assert.CollectT) {
+		response, err := client.Get("http://127.0.0.1:9878/healthz")
+		if !assert.NoError(c, err) {
+			return
+		}
+		defer response.Body.Close()
+		body, err := io.ReadAll(response.Body)
+		assert.NoError(c, err)
+		assert.Equal(c, http.StatusOK, response.StatusCode)
+		assert.Equal(c, "LIVE", strings.TrimSpace(string(body)))
+	}, 5*time.Second, 50*time.Millisecond, "cached EDS must initialize before the bootstrap fetch timeout")
+	t.Logf("DaemonSet /healthz ready after %s", time.Since(started))
+
+	admin := &http.Client{
+		Timeout: 500 * time.Millisecond,
+		Transport: &http.Transport{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+			var dialer net.Dialer
+			return dialer.DialContext(ctx, "unix", util.GetAdminSocketPath(socketDir))
+		}},
+	}
+	t.Cleanup(admin.CloseIdleConnections)
+	waitForBackend := func(address string) {
+		t.Helper()
+		require.EventuallyWithT(t, func(c *assert.CollectT) {
+			response, err := admin.Get("http://envoy-admin/clusters?format=json")
+			if !assert.NoError(c, err) {
+				return
+			}
+			defer response.Body.Close()
+			body, err := io.ReadAll(response.Body)
+			if !assert.NoError(c, err) {
+				return
+			}
+			var clusters envoy_admin.Clusters
+			if !assert.NoError(c, protojson.Unmarshal(body, &clusters)) {
+				return
+			}
+			for _, cluster := range clusters.ClusterStatuses {
+				if cluster.Name == backend {
+					if assert.Len(c, cluster.HostStatuses, 1) {
+						assert.Equal(c, address, cluster.HostStatuses[0].GetAddress().GetSocketAddress().GetAddress())
+					}
+					return
+				}
+			}
+			assert.Fail(c, "backend cluster missing")
+		}, 3*time.Second, 50*time.Millisecond, "backend EDS must keep updating when locality is enabled")
+	}
+	waitForBackend("192.0.2.10")
+	update := xds.NewResources()
+	update.Endpoints[backend] = backendAssignment("192.0.2.11")
+	require.NoError(t, server.UpsertEnvoyResources(ctx, update, nil))
+	waitForBackend("192.0.2.11")
+
+	// During rollout an old DaemonSet pod never subscribes to the source
+	// cluster. Publishing it must not stop that pod's ordinary backend updates.
+	update.Endpoints[LocalityClusterName] = &envoy_config_endpoint.ClusterLoadAssignment{ClusterName: LocalityClusterName}
+	update.Endpoints[backend] = backendAssignment("192.0.2.12")
+	require.NoError(t, server.UpsertEnvoyResources(ctx, update, nil))
+	waitForBackend("192.0.2.12")
 }
 
 func requireEnvoyConfigDumpContains(t *testing.T, admin *EnvoyAdminClient, configType string, needle string) {

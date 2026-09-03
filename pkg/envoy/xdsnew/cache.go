@@ -12,6 +12,7 @@ import (
 	"maps"
 	"slices"
 	"strings"
+	"sync"
 
 	"github.com/davecgh/go-spew/spew"
 	envoy_config_cluster "github.com/envoyproxy/go-control-plane/envoy/config/cluster/v3"
@@ -21,6 +22,7 @@ import (
 	envoy_config_http "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/http_connection_manager/v3"
 	envoy_extensions_filters_network_tcp_proxy "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/tcp_proxy/v3"
 	envoy_config_tls "github.com/envoyproxy/go-control-plane/envoy/extensions/transport_sockets/tls/v3"
+	discovery "github.com/envoyproxy/go-control-plane/envoy/service/discovery/v3"
 	cache_types "github.com/envoyproxy/go-control-plane/pkg/cache/types"
 	cache "github.com/envoyproxy/go-control-plane/pkg/cache/v3"
 	controlplanelog "github.com/envoyproxy/go-control-plane/pkg/log"
@@ -64,6 +66,9 @@ type cacheImpl struct {
 	hasher              hash.Hash32
 	completionCbs       *callbacks.CompletionCallbacks
 	bootstrapEndpoints  []string
+	strictAdsMode       bool
+	bootstrapMutex      lock.Mutex
+	bootstrapStreams    map[chan cache.Response]*bootstrapResponseStream
 }
 
 var _ Cache = &cacheImpl{}
@@ -255,6 +260,7 @@ func NewCache(logger *slog.Logger, strictAdsMode bool, bootstrapEndpoints ...str
 		hasher:              fnv.New32a(),
 		completionCbs:       callbacks.NewCompletionCallbacks(logger),
 		bootstrapEndpoints:  slices.Clone(bootstrapEndpoints),
+		strictAdsMode:       strictAdsMode,
 	}
 }
 
@@ -723,7 +729,213 @@ func (c *cacheImpl) CreateWatch(request *cache.Request, sub cache.Subscription, 
 		return func() {}, nil
 	}
 	request = normalizeCustomWildcardRequest(request, sub)
+	if request != nil && c.strictAdsMode && len(c.bootstrapEndpoints) != 0 {
+		return c.createBootstrapWatch(request, sub, respChan)
+	}
 	return c.SnapshotCache.CreateWatch(request, sub, respChan)
+}
+
+func (c *cacheImpl) normalizeBootstrapEndpointRequest(request *cache.Request, sub cache.Subscription) *cache.Request {
+	if !c.strictAdsMode || len(c.bootstrapEndpoints) == 0 || request.GetTypeUrl() != envoy_resource.EndpointType || len(request.GetResourceNames()) == 0 {
+		return request
+	}
+	if sub != nil && sub.IsWildcard() {
+		return request
+	}
+
+	bootstrapOnly := true
+	for _, name := range request.ResourceNames {
+		if !slices.Contains(c.bootstrapEndpoints, name) {
+			bootstrapOnly = false
+			break
+		}
+	}
+	if bootstrapOnly {
+		// Static EDS clusters initialize before CDS. Waiting for every CDS
+		// endpoint name here would keep the bootstrap cluster warming.
+		normalized := proto.Clone(request).(*cache.Request)
+		normalized.ResourceNames = nil
+		return normalized
+	}
+
+	var normalized *cache.Request
+	for _, name := range c.bootstrapEndpoints {
+		if !slices.Contains(request.ResourceNames, name) {
+			if normalized == nil {
+				normalized = proto.Clone(request).(*cache.Request)
+			}
+			// A DaemonSet pod may still have the old bootstrap during rollout.
+			// Exempt bootstrap names from the cache's completeness check, but
+			// still require all ordinary backend names in a strict ADS request.
+			normalized.ResourceNames = append(normalized.ResourceNames, name)
+		}
+	}
+	if normalized != nil {
+		return normalized
+	}
+	return request
+}
+
+// All resource types on an ADS stream must use the same relay. Relaying only
+// bootstrap EDS would let later LDS responses overtake it during publication.
+type bootstrapResponseStream struct {
+	responses chan cache.Response
+	done      chan struct{}
+	stopped   chan struct{}
+	watches   map[*cache.Request]*bootstrapResponseWatch // guarded by bootstrapMutex
+}
+
+type bootstrapResponseWatch struct {
+	request   *cache.Request
+	requested map[string]struct{}
+	done      chan struct{}
+	mutex     lock.Mutex
+}
+
+func (c *cacheImpl) createBootstrapWatch(request *cache.Request, sub cache.Subscription, respChan chan cache.Response) (func(), error) {
+	normalized := c.normalizeBootstrapEndpointRequest(request, sub)
+	watch := &bootstrapResponseWatch{request: request, done: make(chan struct{})}
+	if normalized == request {
+		// A caller may reuse its request after cancellation. Give each cache
+		// watch its own key so a queued old response cannot match the new watch.
+		normalized = proto.Clone(request).(*cache.Request)
+	} else {
+		watch.requested = make(map[string]struct{}, len(request.ResourceNames))
+		for _, name := range request.ResourceNames {
+			watch.requested[name] = struct{}{}
+		}
+	}
+
+	c.bootstrapMutex.Lock()
+	if c.bootstrapStreams == nil {
+		c.bootstrapStreams = make(map[chan cache.Response]*bootstrapResponseStream)
+	}
+	stream, exists := c.bootstrapStreams[respChan]
+	if !exists {
+		stream = &bootstrapResponseStream{
+			responses: make(chan cache.Response, max(cap(respChan), int(cache_types.UnknownType))),
+			done:      make(chan struct{}),
+			stopped:   make(chan struct{}),
+			watches:   make(map[*cache.Request]*bootstrapResponseWatch),
+		}
+		c.bootstrapStreams[respChan] = stream
+	}
+	stream.watches[normalized] = watch
+	c.bootstrapMutex.Unlock()
+	if !exists {
+		go c.relayBootstrapResponses(stream, respChan)
+	}
+
+	cancelWatch, err := c.SnapshotCache.CreateWatch(normalized, sub, stream.responses)
+	cancel := sync.OnceFunc(func() {
+		close(watch.done)
+		if cancelWatch != nil {
+			cancelWatch()
+		}
+		// Ordered ADS drains queued responses after cancelling the old watch.
+		// Wait for any in-flight send before that drain, even if other resource
+		// watches keep this stream's relay alive.
+		watch.mutex.Lock()
+		watch.mutex.Unlock()
+		c.bootstrapMutex.Lock()
+		delete(stream.watches, normalized)
+		last := len(stream.watches) == 0
+		if last {
+			delete(c.bootstrapStreams, respChan)
+			close(stream.done)
+		}
+		c.bootstrapMutex.Unlock()
+		if last {
+			<-stream.stopped
+		}
+	})
+	if err != nil {
+		cancel()
+		return nil, err
+	}
+	return cancel, nil
+}
+
+func (c *cacheImpl) relayBootstrapResponses(stream *bootstrapResponseStream, respChan chan cache.Response) {
+	defer close(stream.stopped)
+	for {
+		select {
+		case <-stream.done:
+			return
+		case response := <-stream.responses:
+			c.bootstrapMutex.Lock()
+			watch := stream.watches[response.GetRequest()]
+			c.bootstrapMutex.Unlock()
+			if watch != nil {
+				watch.forward(response, respChan)
+			}
+		}
+	}
+}
+
+func (w *bootstrapResponseWatch) forward(response cache.Response, respChan chan cache.Response) {
+	w.mutex.Lock()
+	defer w.mutex.Unlock()
+	select {
+	case <-w.done:
+		return
+	default:
+	}
+	select {
+	case <-w.done:
+	case respChan <- &bootstrapEndpointResponse{Response: response, request: w.request, requested: w.requested}:
+	}
+}
+
+// bootstrapEndpointResponse restores the caller's request after normalization.
+// When bootstrap names were added or removed, filter both the wire response and
+// returned-resource bookkeeping back to the client's actual subscription.
+type bootstrapEndpointResponse struct {
+	cache.Response
+	request   *cache.Request
+	requested map[string]struct{}
+}
+
+func (r *bootstrapEndpointResponse) GetRequest() *cache.Request { return r.request }
+
+func (r *bootstrapEndpointResponse) GetReturnedResources() map[string]string {
+	if r.requested == nil {
+		return r.Response.GetReturnedResources()
+	}
+	returned := maps.Clone(r.Response.GetReturnedResources())
+	maps.DeleteFunc(returned, func(name, _ string) bool {
+		_, requested := r.requested[name]
+		return !requested
+	})
+	return returned
+}
+
+func (r *bootstrapEndpointResponse) GetDiscoveryResponse() (*discovery.DiscoveryResponse, error) {
+	if r.requested == nil {
+		return r.Response.GetDiscoveryResponse()
+	}
+	response, err := r.Response.GetDiscoveryResponse()
+	if err != nil {
+		return nil, err
+	}
+	for name := range r.Response.GetReturnedResources() {
+		if _, requested := r.requested[name]; requested {
+			continue
+		}
+		filtered := proto.Clone(response).(*discovery.DiscoveryResponse)
+		filtered.Resources = filtered.Resources[:0]
+		for _, resource := range response.Resources {
+			var assignment envoy_config_endpoint.ClusterLoadAssignment
+			if err := resource.UnmarshalTo(&assignment); err != nil {
+				return nil, fmt.Errorf("decode bootstrap EDS response: %w", err)
+			}
+			if _, requested := r.requested[assignment.ClusterName]; requested {
+				filtered.Resources = append(filtered.Resources, resource)
+			}
+		}
+		return filtered, nil
+	}
+	return response, nil
 }
 
 func (c *cacheImpl) GetAllResources(nodeID string) *xds.Resources {

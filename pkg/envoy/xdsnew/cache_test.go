@@ -8,7 +8,9 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"runtime"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -1024,6 +1026,319 @@ func TestCreateWatch_DelegatesToSnapshotCache(t *testing.T) {
 	require.NotNil(t, cancel)
 
 	assert.Equal(t, 1, mock.createWatchCalls)
+}
+
+func newBootstrapEndpointTestCache() (Cache, *xds.Resources) {
+	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
+	c := NewCache(logger, true, "bootstrap-cluster")
+	resources := emptyResources()
+	for _, name := range []string{"backend-1", "backend-2"} {
+		resources.Clusters[name] = &envoy_config_cluster.Cluster{
+			Name:                 name,
+			ClusterDiscoveryType: &envoy_config_cluster.Cluster_Type{Type: envoy_config_cluster.Cluster_EDS},
+		}
+		resources.Endpoints[name] = &envoy_config_endpoint.ClusterLoadAssignment{ClusterName: name}
+	}
+	resources.Endpoints["bootstrap-cluster"] = &envoy_config_endpoint.ClusterLoadAssignment{ClusterName: "bootstrap-cluster"}
+	return c, resources
+}
+
+func publishBootstrapEndpointSnapshot(t *testing.T, c Cache, resources *xds.Resources) string {
+	t.Helper()
+	snapshot, err := c.GenerateSnapshot(resources, slog.Default())
+	require.NoError(t, err)
+	require.NoError(t, CheckSnapshotConsistency(snapshot))
+	require.NoError(t, c.SetSnapshot(t.Context(), "node1", snapshot))
+	return snapshot.GetVersion(envoy_resource.EndpointType)
+}
+
+func receiveBootstrapEndpointResponse(t *testing.T, responses <-chan cache.Response, request *cache.Request, expected ...*envoy_config_endpoint.ClusterLoadAssignment) cache.Response {
+	t.Helper()
+	var response cache.Response
+	select {
+	case response = <-responses:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for EDS response")
+	}
+	require.Same(t, request, response.GetRequest())
+	discoveryResponse, err := response.GetDiscoveryResponse()
+	require.NoError(t, err)
+	assignments := map[string]*envoy_config_endpoint.ClusterLoadAssignment{}
+	for _, resource := range discoveryResponse.Resources {
+		assignment := &envoy_config_endpoint.ClusterLoadAssignment{}
+		require.NoError(t, resource.UnmarshalTo(assignment))
+		assignments[assignment.ClusterName] = assignment
+	}
+	require.Len(t, discoveryResponse.Resources, len(expected))
+	returned := map[string]string{}
+	for _, assignment := range expected {
+		require.True(t, proto.Equal(assignment, assignments[assignment.ClusterName]), "unexpected EDS for %s: %v", assignment.ClusterName, assignments[assignment.ClusterName])
+		returned[assignment.ClusterName] = response.GetResponseVersion()
+	}
+	// Payload filtering alone is not enough: incorrectly marking an unsent
+	// backend as returned suppresses its later same-version subscription.
+	require.Equal(t, returned, response.GetReturnedResources())
+	return response
+}
+
+func TestCreateWatchBootstrapEndpointsBeforeCDS(t *testing.T) {
+	c, resources := newBootstrapEndpointTestCache()
+	version := publishBootstrapEndpointSnapshot(t, c, resources)
+	request := &cache.Request{
+		Node:          &envoy_config_core.Node{Id: "node1"},
+		TypeUrl:       envoy_resource.EndpointType,
+		ResourceNames: []string{"bootstrap-cluster"},
+	}
+	original := proto.Clone(request)
+	subscription := stream.NewSotwSubscription(request.ResourceNames, false)
+	responses := make(chan cache.Response, 1)
+	cancel, err := c.CreateWatch(request, subscription, responses)
+	require.NoError(t, err)
+	defer cancel()
+	response := receiveBootstrapEndpointResponse(t, responses, request, resources.Endpoints["bootstrap-cluster"])
+	cancel()
+	require.True(t, proto.Equal(original, request), "cache mutated the client request")
+	require.Equal(t, version, response.GetResponseVersion())
+
+	// Once the bootstrap cluster initializes, CDS introduces the backend
+	// subscriptions without changing the snapshot's EDS version.
+	request = proto.Clone(request).(*cache.Request)
+	request.VersionInfo = version
+	request.ResourceNames = []string{"bootstrap-cluster", "backend-1", "backend-2"}
+	subscription.SetReturnedResources(response.GetReturnedResources())
+	subscription.SetResourceSubscription(request.ResourceNames)
+	cancel, err = c.CreateWatch(request, subscription, responses)
+	require.NoError(t, err)
+	defer cancel()
+	response = receiveBootstrapEndpointResponse(t, responses, request,
+		resources.Endpoints["bootstrap-cluster"], resources.Endpoints["backend-1"], resources.Endpoints["backend-2"])
+	require.Equal(t, version, response.GetResponseVersion())
+}
+
+func TestCreateWatchBootstrapEndpointsDuringRollout(t *testing.T) {
+	c, resources := newBootstrapEndpointTestCache()
+	delete(resources.Endpoints, "bootstrap-cluster")
+	publishBootstrapEndpointSnapshot(t, c, resources)
+	request := &cache.Request{
+		Node:          &envoy_config_core.Node{Id: "node1"},
+		TypeUrl:       envoy_resource.EndpointType,
+		ResourceNames: []string{"backend-1", "backend-2"},
+	}
+	subscription := stream.NewSotwSubscription(request.ResourceNames, false)
+	responses := make(chan cache.Response, 1)
+	cancel, err := c.CreateWatch(request, subscription, responses)
+	require.NoError(t, err)
+	defer cancel()
+	response := receiveBootstrapEndpointResponse(t, responses, request, resources.Endpoints["backend-1"], resources.Endpoints["backend-2"])
+	cancel()
+
+	// The agent enables locality while this Envoy still has its old bootstrap.
+	// Keep renewing the watch across publications, including source removal.
+	for i := range 3 {
+		request = proto.Clone(request).(*cache.Request)
+		request.VersionInfo = response.GetResponseVersion()
+		subscription.SetReturnedResources(response.GetReturnedResources())
+		cancel, err = c.CreateWatch(request, subscription, responses)
+		require.NoError(t, err)
+		defer cancel()
+		if i < 2 {
+			resources.Endpoints["bootstrap-cluster"] = &envoy_config_endpoint.ClusterLoadAssignment{ClusterName: "bootstrap-cluster"}
+		} else {
+			delete(resources.Endpoints, "bootstrap-cluster")
+		}
+		resources.Endpoints["backend-1"] = &envoy_config_endpoint.ClusterLoadAssignment{
+			ClusterName: "backend-1",
+			Endpoints: []*envoy_config_endpoint.LocalityLbEndpoints{{
+				Locality: &envoy_config_core.Locality{Zone: fmt.Sprintf("zone-%d", i)},
+			}},
+		}
+		publishBootstrapEndpointSnapshot(t, c, resources)
+		response = receiveBootstrapEndpointResponse(t, responses, request, resources.Endpoints["backend-1"], resources.Endpoints["backend-2"])
+		cancel()
+	}
+}
+
+func TestCreateWatchBootstrapEndpointsKeepsBackendCompleteness(t *testing.T) {
+	for _, names := range [][]string{{"backend-1"}, {"bootstrap-cluster", "backend-1"}} {
+		t.Run(fmt.Sprint(names), func(t *testing.T) {
+			c, resources := newBootstrapEndpointTestCache()
+			publishBootstrapEndpointSnapshot(t, c, resources)
+			request := &cache.Request{
+				Node:          &envoy_config_core.Node{Id: "node1"},
+				TypeUrl:       envoy_resource.EndpointType,
+				ResourceNames: names,
+			}
+			responses := make(chan cache.Response, 1)
+			cancel, err := c.CreateWatch(request, stream.NewSotwSubscription(names, false), responses)
+			require.NoError(t, err)
+			defer cancel()
+			select {
+			case response := <-responses:
+				t.Fatalf("incomplete backend subscription received EDS: %v", response.GetReturnedResources())
+			case <-time.After(50 * time.Millisecond):
+			}
+		})
+	}
+}
+
+func TestCreateWatchBootstrapEndpointsPreservesADSOrder(t *testing.T) {
+	// A per-watch relay must not pass just because it happens to run before
+	// the cache publishes the next resource type.
+	defer runtime.GOMAXPROCS(runtime.GOMAXPROCS(1))
+	for _, names := range [][]string{
+		{"backend-1", "backend-2"},
+		{"bootstrap-cluster"},
+		{"bootstrap-cluster", "backend-1", "backend-2"},
+	} {
+		t.Run(fmt.Sprint(names), func(t *testing.T) {
+			c, resources := newBootstrapEndpointTestCache()
+			resources.Listeners["listener"] = &envoy_config_listener.Listener{Name: "listener"}
+			publishBootstrapEndpointSnapshot(t, c, resources)
+			snapshot, err := c.GetSnapshot("node1")
+			require.NoError(t, err)
+			responses := make(chan cache.Response, 2)
+			for _, request := range []*cache.Request{
+				{Node: &envoy_config_core.Node{Id: "node1"}, TypeUrl: envoy_resource.EndpointType, ResourceNames: names},
+				{Node: &envoy_config_core.Node{Id: "node1"}, TypeUrl: envoy_resource.ListenerType},
+			} {
+				request.VersionInfo = snapshot.GetVersion(request.TypeUrl)
+				subscription := stream.NewSotwSubscription(request.ResourceNames, true)
+				returned := map[string]string{}
+				for name := range snapshot.GetResources(request.TypeUrl) {
+					if _, subscribed := subscription.SubscribedResources()[name]; subscribed || subscription.IsWildcard() {
+						returned[name] = request.VersionInfo
+					}
+				}
+				subscription.SetReturnedResources(returned)
+				cancel, err := c.CreateWatch(request, subscription, responses)
+				require.NoError(t, err)
+				defer cancel()
+			}
+
+			resources.Endpoints["backend-1"] = &envoy_config_endpoint.ClusterLoadAssignment{
+				ClusterName: "backend-1",
+				Endpoints:   []*envoy_config_endpoint.LocalityLbEndpoints{{Locality: &envoy_config_core.Locality{Zone: "updated"}}},
+			}
+			resources.Listeners["listener-2"] = &envoy_config_listener.Listener{Name: "listener-2"}
+			publishBootstrapEndpointSnapshot(t, c, resources)
+			for _, typeURL := range []string{envoy_resource.EndpointType, envoy_resource.ListenerType} {
+				select {
+				case response := <-responses:
+					require.Equal(t, typeURL, response.GetRequest().GetTypeUrl(), "listener update overtook EDS")
+				case <-time.After(2 * time.Second):
+					t.Fatalf("timed out waiting for %s", typeURL)
+				}
+			}
+		})
+	}
+}
+
+func TestCreateWatchBootstrapEndpointsIndependentStreams(t *testing.T) {
+	c, resources := newBootstrapEndpointTestCache()
+	publishBootstrapEndpointSnapshot(t, c, resources)
+	request := &cache.Request{
+		Node:          &envoy_config_core.Node{Id: "node1"},
+		TypeUrl:       envoy_resource.EndpointType,
+		ResourceNames: []string{"bootstrap-cluster"},
+	}
+	blocked := make(chan cache.Response)
+	cancelBlocked, err := c.CreateWatch(request, stream.NewSotwSubscription(request.ResourceNames, false), blocked)
+	require.NoError(t, err)
+	defer cancelBlocked()
+
+	responses := make(chan cache.Response, 1)
+	cancel, err := c.CreateWatch(request, stream.NewSotwSubscription(request.ResourceNames, false), responses)
+	require.NoError(t, err)
+	defer cancel()
+	// A blocked old stream must not stall the replacement Envoy's stream.
+	receiveBootstrapEndpointResponse(t, responses, request, resources.Endpoints["bootstrap-cluster"])
+	cancel()
+	// Closing one stream must leave the other stream's relay intact.
+	receiveBootstrapEndpointResponse(t, blocked, request, resources.Endpoints["bootstrap-cluster"])
+}
+
+func TestCreateWatchBootstrapEndpointsCancelledQueuedResponse(t *testing.T) {
+	c, resources := newBootstrapEndpointTestCache()
+	publishBootstrapEndpointSnapshot(t, c, resources)
+	// Hold the shared relay on CDS so the first EDS response stays queued.
+	responses := make(chan cache.Response)
+	cdsRequest := &cache.Request{Node: &envoy_config_core.Node{Id: "node1"}, TypeUrl: envoy_resource.ClusterType}
+	cancelCDS, err := c.CreateWatch(cdsRequest, stream.NewSotwSubscription(nil, true), responses)
+	require.NoError(t, err)
+	defer cancelCDS()
+	request := &cache.Request{
+		Node:          &envoy_config_core.Node{Id: "node1"},
+		TypeUrl:       envoy_resource.EndpointType,
+		ResourceNames: []string{"bootstrap-cluster", "backend-1", "backend-2"},
+	}
+	subscription := stream.NewSotwSubscription(request.ResourceNames, false)
+	cancel, err := c.CreateWatch(request, subscription, responses)
+	require.NoError(t, err)
+	defer cancel()
+	cancel()
+
+	resources.Endpoints["bootstrap-cluster"] = &envoy_config_endpoint.ClusterLoadAssignment{
+		ClusterName: "bootstrap-cluster",
+		Endpoints:   []*envoy_config_endpoint.LocalityLbEndpoints{{Locality: &envoy_config_core.Locality{Zone: "updated"}}},
+	}
+	publishBootstrapEndpointSnapshot(t, c, resources)
+	// Reusing the request must not associate the cancelled response with this
+	// new watch, even though another resource keeps the shared relay alive.
+	cancel, err = c.CreateWatch(request, subscription, responses)
+	require.NoError(t, err)
+	defer cancel()
+	select {
+	case response := <-responses:
+		require.Same(t, cdsRequest, response.GetRequest())
+		discoveryResponse, err := response.GetDiscoveryResponse()
+		require.NoError(t, err)
+		require.Len(t, discoveryResponse.Resources, len(resources.Clusters))
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for CDS response")
+	}
+	receiveBootstrapEndpointResponse(t, responses, request,
+		resources.Endpoints["bootstrap-cluster"], resources.Endpoints["backend-1"], resources.Endpoints["backend-2"])
+	cancel()
+	cancelCDS()
+}
+
+func TestCreateWatchBootstrapEndpointsCancellation(t *testing.T) {
+	for _, snapshotExists := range []bool{false, true} {
+		t.Run(fmt.Sprintf("snapshot=%t", snapshotExists), func(t *testing.T) {
+			c, resources := newBootstrapEndpointTestCache()
+			if snapshotExists {
+				publishBootstrapEndpointSnapshot(t, c, resources)
+			}
+			request := &cache.Request{
+				Node:          &envoy_config_core.Node{Id: "node1"},
+				TypeUrl:       envoy_resource.EndpointType,
+				ResourceNames: []string{"bootstrap-cluster"},
+			}
+			// An unbuffered output also exercises cancellation while the relay
+			// waits for the ADS stream to consume an already-available response.
+			responses := make(chan cache.Response)
+			cancel, err := c.CreateWatch(request, stream.NewSotwSubscription(request.ResourceNames, false), responses)
+			require.NoError(t, err)
+			stopped := make(chan struct{})
+			go func() {
+				cancel()
+				cancel()
+				close(stopped)
+			}()
+			select {
+			case <-stopped:
+			case <-time.After(2 * time.Second):
+				t.Fatal("EDS watch cancellation blocked")
+			}
+			require.Zero(t, c.GetStatusInfo("node1").GetNumWatches())
+			publishBootstrapEndpointSnapshot(t, c, resources)
+			select {
+			case <-responses:
+				t.Fatal("EDS response arrived after cancellation")
+			default:
+			}
+		})
+	}
 }
 
 func TestCreateWatch_IgnoresEmptySecretSubscription(t *testing.T) {
